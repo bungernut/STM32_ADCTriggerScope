@@ -1,28 +1,30 @@
 /* USER CODE BEGIN Header */
 /**
-  ******************************************************************************
-  * @file           : main.c
-  * @brief          : Main program body
-  ******************************************************************************
-  * @attention
-  *
-  * <h2><center>&copy; Copyright (c) 2020 STMicroelectronics.
-  * All rights reserved.</center></h2>
-  *
-  * This software component is licensed by ST under BSD 3-Clause license,
-  * the "License"; You may not use this file except in compliance with the
-  * License. You may obtain a copy of the License at:
-  *                        opensource.org/licenses/BSD-3-Clause
-  *
-  ******************************************************************************
-  */
+ ******************************************************************************
+ * @file           : main.c
+ * @brief          : Main program body
+ ******************************************************************************
+ * @attention
+ *
+ * <h2><center>&copy; Copyright (c) 2020 STMicroelectronics.
+ * All rights reserved.</center></h2>
+ *
+ * This software component is licensed by ST under BSD 3-Clause license,
+ * the "License"; You may not use this file except in compliance with the
+ * License. You may obtain a copy of the License at:
+ *                        opensource.org/licenses/BSD-3-Clause
+ *
+ ******************************************************************************
+ */
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <stdio.h>
+#include <string.h>
+#include "base64.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -32,10 +34,11 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define ADC_BUF_LEN 4096
-#define ADC_BUF_HLEN ADC_BUF_LEN/2
-#define FIFO_WFLEN 500
-#define FIFO_NUMWF 8
+#define ADC_BUF_LEN 2000 // used to be 2064, no obvious difference w/ 5000... Needs to be even for below variable,
+#define ADC_BUF_HLEN 100 // ADC_BUF_LEN/2
+#define FIFO_WFLEN 750 //For some reason this stops working between 700 and 800 with python readout, no compile errors at any value <=1000
+#define FIFO_NUMWF 2 // used to be 8...
+#define WF_PRE_SAMPLES 50
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -47,17 +50,31 @@
 ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_adc1;
 
+CRC_HandleTypeDef hcrc;
+
 RTC_HandleTypeDef hrtc;
 
-USART_HandleTypeDef husart1;
 UART_HandleTypeDef huart2;
+DMA_HandleTypeDef hdma_usart2_tx;
 
 /* USER CODE BEGIN PV */
+RTC_TimeTypeDef sTime;
+RTC_DateTypeDef sDate;
+
 uint16_t adc_buf[ADC_BUF_LEN];
 uint16_t fifo[FIFO_NUMWF][FIFO_WFLEN];
-uint16_t trig_threshold = 1024;
+uint16_t trig_threshold = 100;
+/* Holds 1 if FIFO holds data */
 uint8_t fifo_status;
-uint16_t active_trigger;
+/* the register where the threshold was meet, so need to be able to hold a value
+ * up to ADC_BUF_LEN it is -1 if there is no active trigger*/
+int16_t active_trigger = -1;
+char tx_dma_buffer[4000]; // for the UART2 TX buffer
+
+char datetime_str[25];
+// DEBUG CRAP
+uint16_t tmp_a, tmp_b, tmp_c, tmp_d;
+uint16_t wf_type;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -66,8 +83,8 @@ static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_ADC1_Init(void);
+static void MX_CRC_Init(void);
 static void MX_RTC_Init(void);
-static void MX_USART1_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -108,20 +125,38 @@ int main(void)
   MX_DMA_Init();
   MX_USART2_UART_Init();
   MX_ADC1_Init();
+  MX_CRC_Init();
   MX_RTC_Init();
-  MX_USART1_Init();
   /* USER CODE BEGIN 2 */
-  HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buf, ADC_BUF_LEN);
+	HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buf, ADC_BUF_LEN);
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  while (1)
-  {
+	while (1)
+	{
+		if (fifo_status != 0x00){
+			/* IF there is a waveform in the FIFO, then get the time from the RTC and then transmit the TX buffer */
+			HAL_RTC_GetTime(&hrtc, &sTime, RTC_FORMAT_BIN);
+			HAL_RTC_GetDate(&hrtc, &sDate, RTC_FORMAT_BIN);
+			int fsec = (999 - sTime.SubSeconds*1000 / sTime.SecondFraction);
+			if (fsec < 0){ fsec=0;}
+			else if (fsec > 999){fsec=0;}
+			sprintf(datetime_str, "%02d%02d%02d_%02d:%02d:%02d.%03d\r\n", sDate.Year, sDate.Month, sDate.Date, sTime.Hours, sTime.Minutes, sTime.Seconds, fsec);
+			//HAL_UART_Transmit(&huart2, datetime_str, strlen((char*)datetime_str), 100);
+			fill_tx_buffer();
+			int txret = transmit_buffer_DMA();
+			fifo_status=0;
+		}
+		/*
+		strcpy((char*)datetime_str, "Hello\r\n");
+		HAL_UART_Transmit(&huart2, datetime_str, strlen((char*)datetime_str), 100);
+		HAL_Delay(1000);
+		 */
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-  }
+	}
   /* USER CODE END 3 */
 }
 
@@ -171,9 +206,8 @@ void SystemClock_Config(void)
   }
   /** Initializes the peripherals clocks
   */
-  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_RTC|RCC_PERIPHCLK_USART1
-                              |RCC_PERIPHCLK_USART2|RCC_PERIPHCLK_ADC12;
-  PeriphClkInit.Usart1ClockSelection = RCC_USART1CLKSOURCE_PCLK2;
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_RTC|RCC_PERIPHCLK_USART2
+                              |RCC_PERIPHCLK_ADC12;
   PeriphClkInit.Usart2ClockSelection = RCC_USART2CLKSOURCE_PCLK1;
   PeriphClkInit.Adc12ClockSelection = RCC_ADC12CLKSOURCE_SYSCLK;
   PeriphClkInit.RTCClockSelection = RCC_RTCCLKSOURCE_LSI;
@@ -218,7 +252,7 @@ static void MX_ADC1_Init(void)
   hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
   hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
   hadc1.Init.DMAContinuousRequests = ENABLE;
-  hadc1.Init.Overrun = ADC_OVR_DATA_PRESERVED;
+  hadc1.Init.Overrun = ADC_OVR_DATA_OVERWRITTEN;
   hadc1.Init.OversamplingMode = DISABLE;
   if (HAL_ADC_Init(&hadc1) != HAL_OK)
   {
@@ -246,6 +280,37 @@ static void MX_ADC1_Init(void)
   /* USER CODE BEGIN ADC1_Init 2 */
 
   /* USER CODE END ADC1_Init 2 */
+
+}
+
+/**
+  * @brief CRC Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_CRC_Init(void)
+{
+
+  /* USER CODE BEGIN CRC_Init 0 */
+
+  /* USER CODE END CRC_Init 0 */
+
+  /* USER CODE BEGIN CRC_Init 1 */
+
+  /* USER CODE END CRC_Init 1 */
+  hcrc.Instance = CRC;
+  hcrc.Init.DefaultPolynomialUse = DEFAULT_POLYNOMIAL_ENABLE;
+  hcrc.Init.DefaultInitValueUse = DEFAULT_INIT_VALUE_ENABLE;
+  hcrc.Init.InputDataInversionMode = CRC_INPUTDATA_INVERSION_NONE;
+  hcrc.Init.OutputDataInversionMode = CRC_OUTPUTDATA_INVERSION_DISABLE;
+  hcrc.InputDataFormat = CRC_INPUTDATA_FORMAT_BYTES;
+  if (HAL_CRC_Init(&hcrc) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN CRC_Init 2 */
+
+  /* USER CODE END CRC_Init 2 */
 
 }
 
@@ -289,76 +354,28 @@ static void MX_RTC_Init(void)
 
   /** Initialize RTC and set the Time and Date
   */
-  sTime.Hours = 0;
-  sTime.Minutes = 0;
-  sTime.Seconds = 0;
-  sTime.SubSeconds = 0;
+  sTime.Hours = 0x0;
+  sTime.Minutes = 0x0;
+  sTime.Seconds = 0x0;
+  sTime.SubSeconds = 0x0;
   sTime.DayLightSaving = RTC_DAYLIGHTSAVING_NONE;
   sTime.StoreOperation = RTC_STOREOPERATION_RESET;
-  if (HAL_RTC_SetTime(&hrtc, &sTime, RTC_FORMAT_BIN) != HAL_OK)
+  if (HAL_RTC_SetTime(&hrtc, &sTime, RTC_FORMAT_BCD) != HAL_OK)
   {
     Error_Handler();
   }
   sDate.WeekDay = RTC_WEEKDAY_MONDAY;
   sDate.Month = RTC_MONTH_JANUARY;
-  sDate.Date = 1;
-  sDate.Year = 0;
+  sDate.Date = 0x1;
+  sDate.Year = 0x0;
 
-  if (HAL_RTC_SetDate(&hrtc, &sDate, RTC_FORMAT_BIN) != HAL_OK)
+  if (HAL_RTC_SetDate(&hrtc, &sDate, RTC_FORMAT_BCD) != HAL_OK)
   {
     Error_Handler();
   }
   /* USER CODE BEGIN RTC_Init 2 */
 
   /* USER CODE END RTC_Init 2 */
-
-}
-
-/**
-  * @brief USART1 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_USART1_Init(void)
-{
-
-  /* USER CODE BEGIN USART1_Init 0 */
-
-  /* USER CODE END USART1_Init 0 */
-
-  /* USER CODE BEGIN USART1_Init 1 */
-
-  /* USER CODE END USART1_Init 1 */
-  husart1.Instance = USART1;
-  husart1.Init.BaudRate = 115200;
-  husart1.Init.WordLength = USART_WORDLENGTH_8B;
-  husart1.Init.StopBits = USART_STOPBITS_1;
-  husart1.Init.Parity = USART_PARITY_NONE;
-  husart1.Init.Mode = USART_MODE_TX_RX;
-  husart1.Init.CLKPolarity = USART_POLARITY_LOW;
-  husart1.Init.CLKPhase = USART_PHASE_1EDGE;
-  husart1.Init.CLKLastBit = USART_LASTBIT_DISABLE;
-  husart1.Init.ClockPrescaler = USART_PRESCALER_DIV1;
-  husart1.SlaveMode = USART_SLAVEMODE_DISABLE;
-  if (HAL_USART_Init(&husart1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_USARTEx_SetTxFifoThreshold(&husart1, USART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_USARTEx_SetRxFifoThreshold(&husart1, USART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_USARTEx_DisableFifoMode(&husart1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN USART1_Init 2 */
-
-  /* USER CODE END USART1_Init 2 */
 
 }
 
@@ -400,7 +417,7 @@ static void MX_USART2_UART_Init(void)
   {
     Error_Handler();
   }
-  if (HAL_UARTEx_DisableFifoMode(&huart2) != HAL_OK)
+  if (HAL_UARTEx_EnableFifoMode(&huart2) != HAL_OK)
   {
     Error_Handler();
   }
@@ -419,11 +436,15 @@ static void MX_DMA_Init(void)
   /* DMA controller clock enable */
   __HAL_RCC_DMAMUX1_CLK_ENABLE();
   __HAL_RCC_DMA1_CLK_ENABLE();
+  __HAL_RCC_DMA2_CLK_ENABLE();
 
   /* DMA interrupt init */
   /* DMA1_Channel1_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+  /* DMA2_Channel1_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Channel1_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Channel1_IRQn);
 
 }
 
@@ -441,29 +462,101 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pin : PB8 */
-  GPIO_InitStruct.Pin = GPIO_PIN_8;
+  /*Configure GPIO pin : LD2_Pin */
+  GPIO_InitStruct.Pin = LD2_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+  HAL_GPIO_Init(LD2_GPIO_Port, &GPIO_InitStruct);
 
 }
 
 /* USER CODE BEGIN 4 */
+void fill_tx_buffer(void){
+	// TODO: Compute CRC?
+	b64_encode(&fifo[0], FIFO_WFLEN*2, &tx_dma_buffer);
+	int i = strlen((char*)tx_dma_buffer);
+	int j;
+	for (j=0; j < strlen((char*)datetime_str); j++){
+		tx_dma_buffer[i+j] = datetime_str[j];
+	}
+	tx_dma_buffer[i+j] = (char)wf_type;
+	tx_dma_buffer[i+j+1] = '-';
+	/* To Decode in python3:
+	 *  b = base64.b64decode(a[:-21])
+	 *  c = numpy.frombuffer(b,dtype=numpy.int16)
+	 * */
+}
+
+int transmit_buffer_DMA(){
+	HAL_UART_Transmit_DMA(&huart2, tx_dma_buffer, strlen((char*)tx_dma_buffer));
+	return 1;
+}
+
+char* get_RTC_datetime(){
+	char *datetime_str = malloc(20);
+	HAL_RTC_GetTime(&hrtc, &sTime, RTC_FORMAT_BIN);
+	HAL_RTC_GetDate(&hrtc, &sDate, RTC_FORMAT_BIN);
+	sprintf(datetime_str, "%02d%02d%02d_%02d:%02d:%02d.%04d\n\r", sDate.Year, sDate.Month, sDate.Date, sTime.Hours, sTime.Minutes, sTime.Seconds, (sTime.SubSeconds/sTime.SecondFraction) );
+	return datetime_str;
+}
 
 void copy_wf_to_fifo (){
-	for (int i=0; i<FIFO_WFLEN; i++){
-		fifo[active_trigger][i] = adc_buf[i+active_trigger];
+	uint16_t i;
+	if ( (active_trigger < ADC_BUF_LEN - FIFO_WFLEN - WF_PRE_SAMPLES) && (active_trigger > WF_PRE_SAMPLES) ){
+		/* The WF capture is in a sequential portion of memory */
+		wf_type = 0;
+		for (i=0; i<FIFO_WFLEN; i++){
+			fifo[0][i] = adc_buf[i + active_trigger - WF_PRE_SAMPLES];
+		}
 	}
-	active_trigger = 0;
-	return;
+	else if (active_trigger > ADC_BUF_LEN - FIFO_WFLEN - WF_PRE_SAMPLES){
+		/* The WF starts near the end of ADC_BUF and some of the data
+		 * will be at the beginning of the buffer  */
+		wf_type = 1;
+		uint16_t overlap = FIFO_WFLEN - (ADC_BUF_LEN - active_trigger) - WF_PRE_SAMPLES;
+		for ( i = active_trigger - WF_PRE_SAMPLES; i < ADC_BUF_LEN; i++ ){
+			fifo[0][i-active_trigger-WF_PRE_SAMPLES] = adc_buf[i];
+		}
+		tmp_a = i;
+		for ( i = 0; i < FIFO_WFLEN - overlap; i++ ){
+			fifo[0][FIFO_WFLEN - overlap + i] = adc_buf[i];
+		}
+		tmp_b = i;
+	}
+	else if (active_trigger < WF_PRE_SAMPLES){
+		/* The WF capture is close enough to the start of the ADC_BUF
+		 * that we need to start on the end of the circular buffer */
+		wf_type = 2;
+		uint16_t overlap = WF_PRE_SAMPLES - active_trigger;
+		for ( i=0; i < overlap; i++ ){
+			fifo[0][i] = adc_buf[ADC_BUF_LEN - overlap + i];
+		}
+		tmp_c = i;
+		for ( i=0; i < FIFO_WFLEN - overlap; i++ ){
+			fifo[0][overlap + i] = adc_buf[i];
+		}
+		tmp_d = i;
+	}
+	// Useful for debugging only:
+
+	uint32_t sum_fifo = 0;
+	for (i=0; i<FIFO_WFLEN; i++){
+		sum_fifo += fifo[0][i];
+	}
+	active_trigger = -1;
+	fifo_status = 1;
 }
 
 void HAL_ADC_ConvHalfCpltCallback (ADC_HandleTypeDef * hadc){
-	if (active_trigger == 0) {
+	if (active_trigger >= 0){
+		/* There is an active trigger in the previous half but
+		 * it needed data from this half to complete the WF*/
+		copy_wf_to_fifo();
+	}
+	else {
 		/* look for a trigger in the half full buffer of new data */
 		for (int i=1; i < ADC_BUF_HLEN; i=i+1){
 			if (adc_buf[i] > trig_threshold) {
@@ -472,15 +565,22 @@ void HAL_ADC_ConvHalfCpltCallback (ADC_HandleTypeDef * hadc){
 			}
 		}
 	}
-	else {
-		/* there is an active trigger going into this buffer so
-		 * we only need to return the final waveform */
+	if (active_trigger >= 0 && active_trigger < (ADC_BUF_HLEN - FIFO_WFLEN - WF_PRE_SAMPLES)) {
+		/* there is an active trigger
+		 * AND the final waveform is entirally inside this half-buffer
+		 * THEN we only need to return the final waveform,
+		 * OTHERWISE the copy will happen next half-buffer fill */
 		copy_wf_to_fifo();
 	}
 }
 
 void HAL_ADC_ConvCpltCallback (ADC_HandleTypeDef * hadc){
-	if (active_trigger == 0) {
+	if (active_trigger >= 0){
+		/* There is an active trigger in the previous half but
+		 * it needed data from this half to complete the WF*/
+		copy_wf_to_fifo();
+	}
+	else {
 		/* look for a trigger in the half full buffer of new data */
 		for (int i=ADC_BUF_HLEN; i < ADC_BUF_LEN; i++){
 			if (adc_buf[i] > trig_threshold) {
@@ -489,19 +589,12 @@ void HAL_ADC_ConvCpltCallback (ADC_HandleTypeDef * hadc){
 			}
 		}
 	}
-	else {
-		/* there is an active trigger going into this buffer so
-		 * we only need to return the final waveform */
+	if (active_trigger >= ADC_BUF_HLEN && active_trigger < (ADC_BUF_LEN - FIFO_WFLEN - WF_PRE_SAMPLES)) {
+		/* there is an active trigger
+		 * AND the final waveform is entirally inside this half-buffer
+		 * THEN we only need to return the final waveform,
+		 * OTHERWISE the copy will happen next half-buffer fill */
 		copy_wf_to_fifo();
-	}
-}
-
-void get_max_adc_first_half(){
-	uint16_t max_val = adc_buf[0];
-	for (int i=1; i < ADC_BUF_LEN/2; i=i+1){
-		if (adc_buf[i] > max_val) {
-			max_val = adc_buf[i];
-		}
 	}
 }
 
@@ -514,7 +607,7 @@ void get_max_adc_first_half(){
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
+	/* User can add his own implementation to report the HAL error return state */
 
   /* USER CODE END Error_Handler_Debug */
 }
@@ -530,7 +623,7 @@ void Error_Handler(void)
 void assert_failed(uint8_t *file, uint32_t line)
 {
   /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line number,
+	/* User can add his own implementation to report the file name and line number,
      tex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
   /* USER CODE END 6 */
 }
